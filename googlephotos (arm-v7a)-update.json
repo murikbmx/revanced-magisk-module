@@ -1,6 +1,6 @@
 {
   "version": "v7.64.0.873168826 (patches 5.50.2.rvp)",
-  "versionCode": 1,
-  "zipUrl": "https://github.com/murikbmx/revanced-magisk-module/releases/download/1/googlephotos-revanced-magisk-v7.64.0.873168826-arm-v7a.zip",
+  "versionCode": 2,
+  "zipUrl": "https://github.com/murikbmx/revanced-magisk-module/releases/download/2/googlephotos-revanced-magisk-v7.64.0.873168826-arm-v7a.zip",
   "changelog": "https://raw.githubusercontent.com/murikbmx/revanced-magisk-module/update/build.md"
 }
