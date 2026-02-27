@@ -5,6 +5,7 @@ CWD=$(pwd)
 TEMP_DIR="temp"
 BIN_DIR="bin"
 BUILD_DIR="build"
+PATCH_EXT=""
 
 if [ "${GITHUB_TOKEN-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
 NEXT_VER_CODE=${NEXT_VER_CODE:-$(date +'%Y%m%d')}
@@ -48,7 +49,6 @@ abort() {
 	epr "ABORT: ${1-}"
 	exit 1
 }
-java() { env -i command java "$@"; }
 
 get_prebuilts() {
 	local cli_src=$1 cli_ver=$2 patches_src=$3 patches_ver=$4
@@ -57,7 +57,7 @@ get_prebuilts() {
 	cl_dir=${TEMP_DIR}/${cl_dir,,}-rv
 	[ -d "$cl_dir" ] || mkdir "$cl_dir"
 
-	for src_ver in "$cli_src CLI $cli_ver cli" "$patches_src Patches $patches_ver patches"; do
+	for src_ver in "$cli_src CLI $cli_ver revanced-cli" "$patches_src Patches $patches_ver patches"; do
 		set -- $src_ver
 		local src=$1 tag=$2 ver=${3-} fprefix=$4
 		local ext
@@ -66,6 +66,7 @@ get_prebuilts() {
 			ext="jar"
 			local grab_cl=false
 		elif [ "$tag" = "Patches" ]; then
+			ext=$PATCH_EXT
 			local grab_cl=true
 		else abort unreachable; fi
 
@@ -88,15 +89,13 @@ get_prebuilts() {
 		fi
 
 		local url file tag_name name
-		file=$(find "$dir" -name "*${fprefix}-${name_ver#v}.${ext}" -type f 2>/dev/null)
+		file=$(find "$dir" -name "${fprefix}-${name_ver#v}.${ext}" -type f 2>/dev/null)
 		if [ -z "$file" ]; then
 			local resp asset name
 			resp=$(gh_req "$rv_rel" -) || return 1
 			tag_name=$(jq -r '.tag_name' <<<"$resp")
-			matches=$(jq -e '.assets | map(select(.name | endswith("asc") | not))' <<<"$resp")
-			if [ "$(jq 'length' <<<"$matches")" -eq 0 ]; then
-				abort "No asset was found"
-			elif [ "$(jq 'length' <<<"$matches")" -ne 1 ]; then
+			matches=$(jq -e ".assets | map(select(.name | endswith(\"$ext\")))" <<<"$resp")
+			if [ "$(jq 'length' <<<"$matches")" -ne 1 ]; then
 				wpr "More than 1 asset was found for this cli release. Falling back to the first one found..."
 			fi
 			asset=$(jq -r ".[0]" <<<"$matches")
@@ -117,16 +116,19 @@ get_prebuilts() {
 			tag_name=v${tag_name%.*}
 		fi
 
-		if [ "$tag" = "Patches" ]; then
+		if [ "$tag" = "CLI" ]; then
+			PATCH_EXT=$(java -jar "$file" -h | grep -oP -m1 '\w+(?= files)' | tr '[:upper:]' '[:lower:]')
+			if [ -z "$PATCH_EXT" ]; then abort "Unable to detect patch extension from CLI help output."; fi
+		elif [ "$tag" = "Patches" ]; then
 			if [ $grab_cl = true ]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
 			if [ "$REMOVE_RV_INTEGRATIONS_CHECKS" = true ]; then
-				local extensions_ext
-				extensions_ext=$(unzip -l "${file}" "extensions/shared*" | grep -o "shared.*") extensions_ext="${extensions_ext#*.}"
+				# inner extension (rvp->rve, mpp->mpe)
+				local inner_ext="${ext%p}e"
 				if ! (
 					mkdir -p "${file}-zip" || return 1
 					unzip -qo "${file}" -d "${file}-zip" || return 1
-					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.${extensions_ext}" "${file}-zip/extensions/shared-patched.${extensions_ext}" || return 1
-					mv -f "${file}-zip/extensions/shared-patched.${extensions_ext}" "${file}-zip/extensions/shared.${extensions_ext}" || return 1
+					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.${inner_ext}" "${file}-zip/extensions/shared-patched.${inner_ext}" || return 1
+					mv -f "${file}-zip/extensions/shared-patched.${inner_ext}" "${file}-zip/extensions/shared.${inner_ext}" || return 1
 					rm "${file}" || return 1
 					cd "${file}-zip" || abort
 					zip -0rq "${CWD}/${file}" . || return 1
@@ -161,7 +163,7 @@ config_update() {
 		if [ -z "$table_name" ]; then continue; fi
 		t=$(toml_get_table "$table_name")
 		enabled=$(toml_get "$t" enabled) || enabled=true
-		if [ "$enabled" = "false" ]; then continue; fi
+		if [ "$enabled" = false ]; then continue; fi
 		PATCHES_SRC=$(toml_get "$t" patches-source) || PATCHES_SRC=$DEF_PATCHES_SRC
 		PATCHES_VER=$(toml_get "$t" patches-version) || PATCHES_VER=$DEF_PATCHES_VER
 		if [[ -v sources["$PATCHES_SRC/$PATCHES_VER"] ]]; then
@@ -176,7 +178,7 @@ config_update() {
 			else
 				last_patches=$(gh_req "$rv_rel/tags/${ver}" -)
 			fi
-			if ! last_patches=$(jq -e -r '.assets[] | select(.name | endswith("asc") | not) | .name' <<<"$last_patches"); then
+			if ! last_patches=$(jq -e -r ".assets[] | select(.name | endswith(\"$PATCH_EXT\")) | .name" <<<"$last_patches"); then
 				abort oops
 			fi
 			if [ "$last_patches" ]; then
@@ -467,7 +469,7 @@ get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
 
 patch_apk() {
 	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jar=$5
-	local cmd="java -jar '$cli_jar' patch '$stock_input' --purge -o '$patched_apk' -p '$patches_jar' --keystore=ks.keystore \
+	local cmd="env -u GITHUB_REPOSITORY java -jar '$cli_jar' patch '$stock_input' --purge -o '$patched_apk' -p '$patches_jar' --keystore=ks.keystore \
 --keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc $patcher_args"
 	if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary='${AAPT2}'"; fi
 	pr "$cmd"
@@ -608,19 +610,16 @@ build_rv() {
 				patcher_args+=("-d \"${microg_patch}\"")
 			fi
 		fi
-		if [ "$build_mode" = module ]; then
-			zip -d "$stock_apk" "lib/*" >/dev/null 2>&1 || :
-		else
-			if [ "$arch" = "arm64-v8a" ]; then
-				zip -d "$stock_apk" "lib/armeabi-v7a/*" "lib/x86_64/*" "lib/x86/*" >/dev/null 2>&1 || :
-			elif [ "$arch" = "arm-v7a" ]; then
-				zip -d "$stock_apk" "lib/arm64-v8a/*" "lib/x86_64/*" "lib/x86/*" >/dev/null 2>&1 || :
-			elif [ "$arch" = "x86" ]; then
-				zip -d "$stock_apk" "lib/arm64-v8a/*" "lib/x86_64/*" "lib/armeabi-v7a/*" >/dev/null 2>&1 || :
-			elif [ "$arch" = "x86_64" ]; then
-				zip -d "$stock_apk" "lib/arm64-v8a/*" "lib/armeabi-v7a/*" "lib/x86/*" >/dev/null 2>&1 || :
+		if [ "${args[riplib]}" = true ]; then
+			patcher_args+=("--rip-lib x86_64 --rip-lib x86")
+			if [ "$build_mode" = module ]; then
+				patcher_args+=("--rip-lib arm64-v8a --rip-lib armeabi-v7a --unsigned")
 			else
-				zip -d "$stock_apk" "lib/x86_64/*" "lib/x86/*" >/dev/null 2>&1 || :
+				if [ "$arch" = "arm64-v8a" ]; then
+					patcher_args+=("--rip-lib armeabi-v7a")
+				elif [ "$arch" = "arm-v7a" ]; then
+					patcher_args+=("--rip-lib arm64-v8a")
+				fi
 			fi
 		fi
 		if [ "${NORB:-}" != true ] || [ ! -f "$patched_apk" ]; then
@@ -646,7 +645,7 @@ build_rv() {
 		module_prop \
 			"${args[module_prop_name]}" \
 			"${app_name} ${args[rv_brand]}" \
-			"${version} (patches ${patches_ver})" \
+			"${version} (patches ${patches_ver%%.$PATCH_EXT})" \
 			"${app_name} ${args[rv_brand]} Magisk module" \
 			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
